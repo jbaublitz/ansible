@@ -272,14 +272,12 @@ target_tags:
     sample: [ 'foo', 'bar' ]
 '''
 try:
-    from libcloud.compute.types import Provider
-    from libcloud.compute.providers import get_driver
-    from libcloud.common.google import GoogleBaseError, QuotaExceededError, \
-            ResourceExistsError, ResourceNotFoundError
-    _ = Provider.GCE
-    HAS_LIBCLOUD = True
+    from oauth2client.service_account import ServiceAccountCredentials
+    from apiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    HAS_GOOGLE_API_PYTHON_CLIENT = True
 except ImportError:
-    HAS_LIBCLOUD = False
+    HAS_GOOGLE_API_PYTHON_CLIENT = False
 
 def format_allowed_section(allowed):
     """Format each section of the allowed list"""
@@ -340,10 +338,10 @@ def main():
         )
     )
 
-    if not HAS_LIBCLOUD:
-        module.fail_json(msg='libcloud with GCE support (0.17.0+) required for this module')
+    if not HAS_GOOGLE_API_PYTHON_CLIENT:
+        module.fail_json(msg='google-api-python-client required for this module')
 
-    gce = gce_connect(module)
+    (http, connection) = get_google_api_auth(module)
 
     allowed = module.params.get('allowed')
     ipv4_range = module.params.get('ipv4_range')
@@ -357,32 +355,36 @@ def main():
     subnet_name = module.params.get('subnet_name')
     subnet_region = module.params.get('subnet_region')
     subnet_desc = module.params.get('subnet_desc')
+    project_id = module.params.get('project_id')
 
     changed = False
     json_output = {'state': state}
 
+    compute = build('compute', 'v1', http=http)
+    network_api = compute.networks()
+    subnet_api = compute.subnetworks()
     if state in ['active', 'present']:
-        network = None
-        subnet = None
+        network_api = compute.networks()
+        subnet_api = compute.subnetworks()
+        network_response = None
+        subnet_response = None
         try:
-            network = gce.ex_get_network(name)
+            network_request = network_api.get(project=project_id, network=name)
+            network_response = execute_sync(module, network_request)
             json_output['name'] = name
             if mode == 'legacy':
-                json_output['ipv4_range'] = network.cidr
-            if network and mode == 'custom' and subnet_name:
-                if not hasattr(gce, 'ex_get_subnetwork'):
-                    module.fail_json(msg="Update libcloud to a more recent version (>1.0) that supports network 'mode' parameter", changed=False)
-
+                json_output['ipv4_range'] = ipv4_range
+            if network_response and mode == 'custom' and subnet_name:
                 subnet = gce.ex_get_subnetwork(subnet_name, region=subnet_region)
                 json_output['subnet_name'] = subnet_name
-                json_output['ipv4_range'] = subnet.cidr
-        except ResourceNotFoundError:
+                json_output['ipv4_range'] = ipv4_range
+        except HttpError as e:
             pass
         except Exception as e:
             module.fail_json(msg=unexpected_error_msg(e), changed=False)
 
         # user wants to create a new network that doesn't yet exist
-        if name and not network:
+        if name and not network_response:
             if not ipv4_range and mode != 'auto':
                 module.fail_json(msg="Network '" + name + "' is not found. To create network in legacy or custom mode, 'ipv4_range' parameter is required",
                     changed=False)
@@ -392,7 +394,14 @@ def main():
                 kwargs['mode'] = mode
 
             try:
-                network = gce.ex_create_network(name, *args, **kwargs)
+                body = {}
+                if not ipv4_range:
+                    body['autoCreateSubnetworks'] = mode == 'auto'
+                body['IPv4Range'] = ipv4_range
+                body['name'] = name
+                network_request = network_api.insert(project=project_id, body=body)
+                network_poll_request = network_api.get(project=project_id, network=name)
+                network_response = execute_sync(module, network_request, network_poll_request)
                 json_output['name'] = name
                 json_output['ipv4_range'] = ipv4_range
                 changed = True
@@ -401,9 +410,7 @@ def main():
             except Exception as e:
                 module.fail_json(msg=unexpected_error_msg(e), changed=False)
 
-        if (subnet_name or ipv4_range) and not subnet and mode == 'custom':
-            if not hasattr(gce, 'ex_create_subnetwork'):
-                module.fail_json(msg='Update libcloud to a more recent version (>1.0) that supports subnetwork creation', changed=changed)
+        if (subnet_name or ipv4_range) and not subnet_response and mode == 'custom':
             if not subnet_name or not ipv4_range or not subnet_region:
                 module.fail_json(msg="subnet_name, ipv4_range, and subnet_region required for custom mode", changed=changed)
 
@@ -415,136 +422,137 @@ def main():
             except Exception as e:
                 module.fail_json(msg=unexpected_error_msg(e), changed=changed)
 
-        if fwname:
-            # user creating a firewall rule
-            if not allowed and not src_range and not src_tags:
-                if changed and network:
-                    module.fail_json(
-                        msg="Network created, but missing required " + \
-                        "firewall rule parameter(s)", changed=True)
-                module.fail_json(
-                    msg="Missing required firewall rule parameter(s)",
-                    changed=False)
-
-            allowed_list = format_allowed(allowed)
-
-            # Fetch existing rule and if it exists, compare attributes
-            # update if attributes changed.  Create if doesn't exist.
-            try:
-                fw_changed = False
-                fw = gce.ex_get_firewall(fwname)
-
-                # If old and new attributes are different, we update the firewall rule.
-                # This implicitly lets us clear out attributes as well.
-                # allowed_list is required and must not be None for firewall rules.
-                if allowed_list and (sorted_allowed_list(allowed_list) != sorted_allowed_list(fw.allowed)):
-                    fw.allowed = allowed_list
-                    fw_changed = True
-
-                # source_ranges might not be set in the project; cast it to an empty list
-                fw.source_ranges = fw.source_ranges or []
-
-                # If these attributes are lists, we sort them first, then compare.
-                # Otherwise, we update if they differ.
-                if fw.source_ranges != src_range:
-                    if isinstance(src_range, list):
-                        if sorted(fw.source_ranges) != sorted(src_range):
-                            fw.source_ranges = src_range
-                            fw_changed = True
-                    else:
-                        fw.source_ranges = src_range
-                        fw_changed = True
-
-                # source_tags might not be set in the project; cast it to an empty list
-                fw.source_tags = fw.source_tags or []
-
-                if fw.source_tags != src_tags:
-                    if isinstance(src_tags, list):
-                        if sorted(fw.source_tags) != sorted(src_tags):
-                            fw.source_tags = src_tags
-                            fw_changed = True
-                    else:
-                        fw.source_tags = src_tags
-                        fw_changed = True
-
-                # target_tags might not be set in the project; cast it to an empty list
-                fw.target_tags = fw.target_tags or []
-
-                if fw.target_tags != target_tags:
-                    if isinstance(target_tags, list):
-                        if sorted(fw.target_tags) != sorted(target_tags):
-                            fw.target_tags = target_tags
-                            fw_changed = True
-                    else:
-                        fw.target_tags = target_tags
-                        fw_changed = True
-
-                if fw_changed is True:
-                    try:
-                        gce.ex_update_firewall(fw)
-                        changed = True
-                    except Exception as e:
-                        module.fail_json(msg=unexpected_error_msg(e), changed=False)
-
-            # Firewall rule not found so we try to create it.
-            except ResourceNotFoundError:
-                try:
-                    gce.ex_create_firewall(fwname, allowed_list, network=name,
-                        source_ranges=src_range, source_tags=src_tags, target_tags=target_tags)
-                    changed = True
-
-                except Exception as e:
-                    module.fail_json(msg=unexpected_error_msg(e), changed=False)
-
-            except Exception as e:
-                module.fail_json(msg=unexpected_error_msg(e), changed=False)
-
-            json_output['fwname'] = fwname
-            json_output['allowed'] = allowed
-            json_output['src_range'] = src_range
-            json_output['src_tags'] = src_tags
-            json_output['target_tags'] = target_tags
-
+#        if fwname:
+#            # user creating a firewall rule
+#            if not allowed and not src_range and not src_tags:
+#                if changed and network:
+#                    module.fail_json(
+#                        msg="Network created, but missing required " + \
+#                        "firewall rule parameter(s)", changed=True)
+#                module.fail_json(
+#                    msg="Missing required firewall rule parameter(s)",
+#                    changed=False)
+#
+#            allowed_list = format_allowed(allowed)
+#
+#            # Fetch existing rule and if it exists, compare attributes
+#            # update if attributes changed.  Create if doesn't exist.
+#            try:
+#                fw_changed = False
+#                fw = gce.ex_get_firewall(fwname)
+#
+#                # If old and new attributes are different, we update the firewall rule.
+#                # This implicitly lets us clear out attributes as well.
+#                # allowed_list is required and must not be None for firewall rules.
+#                if allowed_list and (sorted_allowed_list(allowed_list) != sorted_allowed_list(fw.allowed)):
+#                    fw.allowed = allowed_list
+#                    fw_changed = True
+#
+#                # source_ranges might not be set in the project; cast it to an empty list
+#                fw.source_ranges = fw.source_ranges or []
+#
+#                # If these attributes are lists, we sort them first, then compare.
+#                # Otherwise, we update if they differ.
+#                if fw.source_ranges != src_range:
+#                    if isinstance(src_range, list):
+#                        if sorted(fw.source_ranges) != sorted(src_range):
+#                            fw.source_ranges = src_range
+#                            fw_changed = True
+#                    else:
+#                        fw.source_ranges = src_range
+#                        fw_changed = True
+#
+#                # source_tags might not be set in the project; cast it to an empty list
+#                fw.source_tags = fw.source_tags or []
+#
+#                if fw.source_tags != src_tags:
+#                    if isinstance(src_tags, list):
+#                        if sorted(fw.source_tags) != sorted(src_tags):
+#                            fw.source_tags = src_tags
+#                            fw_changed = True
+#                    else:
+#                        fw.source_tags = src_tags
+#                        fw_changed = True
+#
+#                # target_tags might not be set in the project; cast it to an empty list
+#                fw.target_tags = fw.target_tags or []
+#
+#                if fw.target_tags != target_tags:
+#                    if isinstance(target_tags, list):
+#                        if sorted(fw.target_tags) != sorted(target_tags):
+#                            fw.target_tags = target_tags
+#                            fw_changed = True
+#                    else:
+#                        fw.target_tags = target_tags
+#                        fw_changed = True
+#
+#                if fw_changed is True:
+#                    try:
+#                        gce.ex_update_firewall(fw)
+#                        changed = True
+#                    except Exception as e:
+#                        module.fail_json(msg=unexpected_error_msg(e), changed=False)
+#
+#            # Firewall rule not found so we try to create it.
+#            except ResourceNotFoundError:
+#                try:
+#                    gce.ex_create_firewall(fwname, allowed_list, network=name,
+#                        source_ranges=src_range, source_tags=src_tags, target_tags=target_tags)
+#                    changed = True
+#
+#                except Exception as e:
+#                    module.fail_json(msg=unexpected_error_msg(e), changed=False)
+#
+#            except Exception as e:
+#                module.fail_json(msg=unexpected_error_msg(e), changed=False)
+#
+#            json_output['fwname'] = fwname
+#            json_output['allowed'] = allowed
+#            json_output['src_range'] = src_range
+#            json_output['src_tags'] = src_tags
+#            json_output['target_tags'] = target_tags
+#
     if state in ['absent', 'deleted']:
-        if fwname:
-            json_output['fwname'] = fwname
-            fw = None
-            try:
-                fw = gce.ex_get_firewall(fwname)
-            except ResourceNotFoundError:
-                pass
-            except Exception as e:
-                module.fail_json(msg=unexpected_error_msg(e), changed=False)
-            if fw:
-                gce.ex_destroy_firewall(fw)
-                changed = True
-        elif subnet_name:
-            if not hasattr(gce, 'ex_get_subnetwork') or not hasattr(gce, 'ex_destroy_subnetwork'):
-                module.fail_json(msg='Update libcloud to a more recent version (>1.0) that supports subnetwork creation', changed=changed)
-            json_output['name'] = subnet_name
-            subnet = None
-            try:
-                subnet = gce.ex_get_subnetwork(subnet_name, region=subnet_region)
-            except ResourceNotFoundError:
-                pass
-            except Exception as e:
-                module.fail_json(msg=unexpected_error_msg(e), changed=False)
-            if subnet:
-                gce.ex_destroy_subnetwork(subnet)
-                changed = True
-        elif name:
+#        if fwname:
+#            json_output['fwname'] = fwname
+#            fw = None
+#            try:
+#                fw = gce.ex_get_firewall(fwname)
+#            except ResourceNotFoundError:
+#                pass
+#            except Exception as e:
+#                module.fail_json(msg=unexpected_error_msg(e), changed=False)
+#            if fw:
+#                gce.ex_destroy_firewall(fw)
+#                changed = True
+#        elif subnet_name:
+#            if not hasattr(gce, 'ex_get_subnetwork') or not hasattr(gce, 'ex_destroy_subnetwork'):
+#                module.fail_json(msg='Update libcloud to a more recent version (>1.0) that supports subnetwork creation', changed=changed)
+#            json_output['name'] = subnet_name
+#            subnet = None
+#            try:
+#                subnet = gce.ex_get_subnetwork(subnet_name, region=subnet_region)
+#            except ResourceNotFoundError:
+#                pass
+#            except Exception as e:
+#                module.fail_json(msg=unexpected_error_msg(e), changed=False)
+#            if subnet:
+#                gce.ex_destroy_subnetwork(subnet)
+#                changed = True
+#        elif name:
+        if name:
             json_output['name'] = name
-            network = None
+            network_response = None
             try:
-                network = gce.ex_get_network(name)
-
-            except ResourceNotFoundError:
-                pass
+                network_request = network_api.get(project=project_id, network=name)
+                network_response = execute_sync(module, network_request, insert=False)
             except Exception as e:
                 module.fail_json(msg=unexpected_error_msg(e), changed=False)
-            if network:
+            if network_response:
                 try:
-                    gce.ex_destroy_network(network)
+                    network_request = network_api.delete(project=project_id, network=name)
+                    poll_request = network_api.get(project=project_id, network=name)
+                    network_response = execute_sync(module, network_request, poll_request=poll_request, insert=False)
                 except Exception as e:
                     module.fail_json(msg=unexpected_error_msg(e), changed=False)
                 changed = True
@@ -555,6 +563,7 @@ def main():
 # import module snippets
 from ansible.module_utils.basic import *
 from ansible.module_utils.gce import *
+from ansible.module_utils.gcp import *
 
 if __name__ == '__main__':
     main()

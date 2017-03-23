@@ -51,7 +51,7 @@ except ImportError as e:
 try:
     import google_auth_httplib2
     from httplib2 import Http
-    from googleapiclient.http import set_user_agent
+    from googleapiclient.http import set_user_agent, HttpError
     HAS_GOOGLE_API_LIB = True
 except ImportError:
     HAS_GOOGLE_API_LIB = False
@@ -387,6 +387,32 @@ def get_google_api_auth(module, scopes=[], user_agent_product='ansible-python-ap
     except Exception as e:
         module.fail_json(msg=unexpected_error_msg(e), changed=False)
         return (None, None)
+
+def execute_sync(module, op_request, poll_request=None, insert=True):
+    op_response = None
+    if poll_request:
+        op_response = op_request.execute()
+    else:
+        try:
+            op_response = op_request.execute()
+        except HttpError:
+            pass
+
+    if poll_request is not None:
+        poll_response = None
+        while True:
+            try:
+                poll_response = poll_request.execute()
+            except HttpError as e:
+                if not insert:
+                    break
+            except Exception as e:
+                module.fail_json(msg=unexpected_error_msg(e))
+            if insert and poll_response:
+                break
+
+    elif op_response:
+        return op_response
 
 def check_min_pkg_version(pkg_name, minimum_version):
     """Minimum required version is >= installed version."""
