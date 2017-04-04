@@ -388,31 +388,36 @@ def get_google_api_auth(module, scopes=[], user_agent_product='ansible-python-ap
         module.fail_json(msg=unexpected_error_msg(e), changed=False)
         return (None, None)
 
-def execute_sync(module, op_request, poll_request=None, insert=True):
-    op_response = None
-    if poll_request:
-        op_response = op_request.execute()
-    else:
-        try:
-            op_response = op_request.execute()
-        except HttpError:
+def execute(module, request, exc='pass'):
+    response = None
+    try:
+        response = request.execute()
+    except HttpError as e:
+        if exc == 'pass':
             pass
+        elif exc == 'return':
+            return
+        elif exc == 'raise':
+            raise
+        elif exc == 'fail':
+            module.fail_json(msg=unexpected_error_msg(e), changed=False)
+        else:
+            module.fail_json(msg="Invalid exception parameter for google-api-python-client helper", changed=False)
+    except Exception as e:
+        module.fail_json(msg=unexpected_error_msg(e), changed=False)
 
-    if poll_request is not None:
-        poll_response = None
-        while True:
-            try:
-                poll_response = poll_request.execute()
-            except HttpError as e:
-                if not insert:
-                    break
-            except Exception as e:
-                module.fail_json(msg=unexpected_error_msg(e))
-            if insert and poll_response:
-                break
+    return response
 
-    elif op_response:
-        return op_response
+def execute_poll(module, request, poll, exc='pass'):
+    response = execute(module, request, exc='raise')
+
+    poll_response = None
+    while True:
+        poll_response = execute(module, poll, exc=exc)
+        if poll_response is not None:
+            break
+
+    return poll_response
 
 def check_min_pkg_version(pkg_name, minimum_version):
     """Minimum required version is >= installed version."""
